@@ -1,0 +1,1388 @@
+---
+title: "Analiza Emocji Komentarzy Youtube"
+title-block-banner: true
+author: Jakub Pilchoń
+
+lang: pl
+
+toc: true
+code-summary: "Code"
+embed-resources: true
+
+bibliography: bibliography.bib
+
+format:
+    html: 
+        #body-width: 2000px
+        code-fold: true
+        echo: false
+        #theme: minty
+        theme: cosmo
+        fig-align: center
+        smooth-scroll: true
+
+        code-links:
+         - text: Orygnialny projekt
+           icon: file-code
+           href: https://github.com/JakubPilchon/TubeComments
+
+jupyter: python3
+execute: 
+  python: yt_zal/bin/python
+---
+```{python importy}
+#| echo: false
+
+import polars as pl # way better pandas alternative
+import plotnine as pltn # ggplot port for python
+import wordcloud
+import langid # library for language identification
+import os
+import geopandas as gpd
+import geodatasets as gdt
+import nltk
+import colorsys
+from scipy.stats import chi2_contingency, t, kruskal
+import numpy as np
+from IPython.display import HTML, Markdown, display, Latex
+from tokenizers import Tokenizer
+from collections import Counter, defaultdict
+import matplotlib.pyplot as plt
+from great_tables import GT, md, html, style, loc
+from typing import Callable, Iterable
+import squarify
+
+pl.Config.set_tbl_hide_column_data_types(True)  
+pl.Config.set_tbl_dataframe_shape_below(True)  
+pl.Config.set_tbl_formatting("MARKDOWN")
+
+
+# mapping from number to category name
+category_dict = {
+    2: "Motoryzacja i pojazdy",
+    1: "Film i animacja",
+    10: "Muzyka",
+    15: "Zwierzęta",
+    17: "Sport",
+    18: "Krótkie filmy",
+    19: "Podróże i wydarzenia",
+    20: "Gry",
+    21: "Wideoblogi",
+    22: "Ludzie i blogi",
+    23: "Komedia",
+    24: "Rozrywka",
+    25: "Wiadomości i polityka",
+    26: "Poradniki i styl życia",
+    27: "Edukacja",
+    28: "Nauka i technologie",
+    29: "Organizacje non-profit i aktywizm",
+    30: "Filmy",
+    31: "Anime / Animacja",
+    32: "Akcja / Przygodowe",
+    33: "Klasyki",
+    34: "Komedia",
+    35: "Dokument",
+    36: "Dramat",
+    37: "Familijne",
+    38: "Zagraniczne",
+    39: "Horror",
+    40: "Sci-Fi / Fantasy",
+    41: "Thriller",
+    42: "Krótkometrażowe",
+    43: "Programy",
+    44: "Zwiastuny"
+}
+
+
+emotion_dict = {
+  "neutral" : "Neutralność",
+  "joy" : "Radość", 
+  "anger" : "Złość",
+  "sadness" : "Smutek",
+  "sarcasm" : "Sarkazm",
+  "curiosity" : "Ciekawość",
+  "gratitude": "Wdzięczność"
+}
+
+emotion_colors = {
+    "Neutralność": "#9E9E9E",  
+    "Radość":       "#996717",  
+    "Złość":        "#D32F2F", 
+    "Smutek":       "#1976D2",  
+    "Sarkazm":      "#7B1FA2",  
+    "Ciekawość":    "#2308a8", 
+    "Wdzięczność":  "#1b5c2c"   
+}
+
+
+def create_color_pallete(hex_num:str) -> Callable[None, str]:
+  hex_num = hex_num.lstrip("#")
+
+  r = int(hex_num[0:2], 16) / 255.0
+  g = int(hex_num[2:4], 16) / 255.0
+  b = int(hex_num[4:6], 16) / 255.0
+
+  (H,S,L) = colorsys.rgb_to_hls(r,g,b)
+  
+  def random_color_func(word=None, font_size=None, position=None, orientation=None, font_path=None, random_state=None) -> str:
+    
+    h = np.clip(H + np.random.uniform(-0.08, 0.08), 0, 1)
+    s = np.clip(S + np.random.uniform(-0.15, 0.15),  0.30, 0.7)
+    l = np.clip(L + np.random.uniform(-0.15, 0.15), 0.30, 0.7)
+
+    r2, g2, b2 = colorsys.hls_to_rgb(h, l, s)
+
+    return f"rgb({int(r2*255)}, {int(g2*255)}, {int(b2*255)})"
+
+  return random_color_func
+
+def custom_data_formatter(numbers: Iterable[float]) -> str:
+  return [f"{int(num/1000)} tyś." if int(num) > 1000 else int(num) for num in numbers]
+
+scale_emotions_color = pltn.scale_color_manual(values = emotion_colors)
+scale_emotions_fill  = pltn.scale_fill_manual(values = emotion_colors)
+```
+
+## Wstęp
+Analiza emocji jest silnie rozwijającym się działem NLP [@plaza-del-arco_emotion_2024]. W czasach dynamicznie rozwijającego się rynku mediów społecznościowych, automatyczna ocena przyjęcia danego filmu może znacząco poprawić działanie dużych agencji influencerskich. 
+
+Celem niniejszej analizy jest sprawdzenie potencjału zbioru danych do wykorzystania w treningu modelu uczenia maszynowego. By odpowiednio zaadresować ten problem, będziemy musieli znaleźć odpowiedzi na następujące pytania:
+
+* Czym różnią się poszczególne emocje w zbiorze danych i jak można je zcharakteryzować.
+* Czy długość komentarza może być przydatną informacją w przewidywaniu emocji?
+* Czy rozkład emocji różni się poprzez różne kategorie wideo?
+* Czy ilości like-ów i odpowiedzi są różnicowane przez emocje wyrażane w komentarzach?
+
+
+
+## Informacje o zbiorze danych {#sec-dataset}
+Oryginalny zbiór danych obejmuje komentarze wraz z metadanymi pobrane poprzez YouTube Data API. W  Dane są publicznie udostępnione w serwisie [Hugging Face](https://huggingface.co/datasets/AmaanP314/youtube-comment-sentiment). Jego [licencja](https://huggingface.co/datasets/choosealicense/licenses/blob/main/markdown/cc-by-sa-4.0.md) zezwala na użycie danych w ten sposób.
+
+Według karty zbioru, dane zostały wstępnie przetworzone np. usunięto znaczniki czasu lub fragmenty kodu. Kolumna `Sentiment` określająca sentyment komentrzarza została stworzona poprzez wykorzystanie dużego modelu językowego (karta zbioru danych wskazuje tutaj na Gemini od Google'a). Warto również zaznaczyć że zbiór został zbalansowany tak, by rozkład cechy `Sentiment` był równy. Na potrzeby dalszej analizy usunięto dodane w ten sposób kolumny.
+
+```{python dataset_loading}
+#| echo: false
+#| label: data-downloading
+
+
+# downloading the files for the first time might take a while.
+#data = pl.read_csv("hf://datasets/AmaanP314/youtube-comment-sentiment/youtube-comments-sentiment.csv")
+data = (pl.read_csv("src_files/data/comments_emotions.csv")
+        .with_columns(
+            pl.col("Emotions").replace_strict(emotion_dict,
+            return_dtype=pl.String)
+            .cast(pl.Categorical))
+    )
+
+display(
+  Markdown(
+    f"Zbiór danych składa się z **{len(data)}** komentarzy, oraz **{len(data.columns)}** cech. Ta duża objętość danych daje ciekawe możliwości analizy i jest obiecującym znakiem dla wytrenowania modelu na tym zbiorze danych."
+  )
+)
+```
+
+### Cechy w zbiorze danych
+*Na podstawie karty zbioru danych*
+
+- **CommentID:** Unikalny identyfikator przydzielony każdemu komentarzowi.
+- **VideoID:** Unikalny identyfikator pozwalający przyporządkować kometarze pod dane wideo.
+- **VideoTitle:** Tytuł wideo pod którym zamieszczono komentarz. Daje on informację o zawartości wideo.
+- **AuthorName:**  Nazwa kanału osoby która zamieściła komentarz. Pozwala ona na zidentyfikowanie autora komentarza.
+- **AuthorChannelID:** Unikalny iidentyfikator przydzielony każdemi kanałowi na YT. Pozwala on na identyfikacje autora komentarza.
+- **CommentText:** Treść komentarza.
+- **Sentiment:** Klasyfikacja sentymentu przydzielona komentarzowi. Przyjmuje wartości `Positive`, `Negative`, `Neutral`.
+- **Likes:** The number of likes received by the comment. This indicates the comment's popularity or agreement from other users.
+- **Replies:** Liczba polubień pod komentarzem.
+- **PublishedAt:** Liczba polubień pod komentarzem.
+- **CountryCode:** Dwuliterowy identyfikator kraju w którym został zamieszczony komentarz
+- **CategoryID:** ID kategori wideo, wskazująca na temat video.
+- **Emotions** klasyfikacja emocji przypisana każdemi komentarzowi. Przyjmuje wartości: `Radość`, `Złość`, `Smutek`, `Sarkazm`, `Ciekawość`, `Wdzięczność`, `Neutralność`
+
+### Przetwarzanie języków
+
+Oryginalny zbiór danych został oznaczony jako wielojęzyczny. Identyfikacja języków w zbiorze danych pomogłaby określić zakres modelu. Gdyby ilość języków w zbiorze danych byłaby równomiernie rozłożone wtedy możnaby zastosować wielo-językową klasyfikację. W przeciwnym wypadku niektóre języki będą niedoreprezentowane, więc lepszym rozwiązaniem wtedy będzie zawężenie zakresu modelu do dominującego języka.
+
+```{python}
+#| echo: false
+
+# Regex generated by llm 
+emoji_removal_regex = (
+    "[\\U0001F300-\\U0001F5FF"
+    "\\U0001F600-\\U0001F64F"
+    "\\U0001F680-\\U0001F6FF"
+    "\\U0001F900-\\U0001F9FF"
+    "\\U0001FA70-\\U0001FAFF"
+    "\\U0001FAE0-\\U0001FAFF"
+    "\\u2600-\\u26FF"
+    "\\u2700-\\u27BF"
+    "\\U0001F1E6-\\U0001F1FF"
+    "\\U0001F191-\\U0001F251"
+    "\\U0001F004"
+    "\\U0001F0CF"
+    "\\U0001F170-\\U0001F171"
+    "\\U0001F17E-\\U0001F17F"
+    "\\U0001F18E"
+    "\\u3030"
+    "\\u2B50"
+    "\\u2B55"
+    "\\u2934-\\u2935"
+    "\\u2B05-\\u2B07"
+    "\\u2B1B-\\u2B1C"
+    "\\u3297"
+    "\\u3299"
+    "\\u303D"
+    "\\u00A9"
+    "\\u00AE"
+    "\\u2122"
+    "\\u23F3"
+    "\\u24C2"
+    "\\u23E9-\\u23EF"
+    "\\u25B6"
+    "\\u23F8-\\u23FA"
+    "\\u200D"
+    "\\uFE0F"
+    "]+"
+)
+```
+
+W celu indentyfikacji języka wykorzystano bibliotekę Langid [@lui_langidpy_2012]. Narzędzie wspiera 97 języków. Warto zauważyć, że predykcje nie są deterministyczne, zatem mogą się one nieco różnić w różnych podejściach.
+
+Jednym z wyzwań są emotikony występujące w komentarzach, ponieważ mogą one zatruć model. By ominąć ten problem przed predykcją usunięto emotikony z komentarzy. Warto również zaznaczyć, że komentarze złożone tylko z emotikon zostały włączone do języka angielskiego.
+
+```{python}
+#| label: code-lang
+# Cahced languages because calculating them is slow
+
+def get_languages(
+                  data: pl.DataFrame
+                 ) -> pl.DataFrame:
+  data = (data
+          .with_columns(Language = pl.col("CommentText")
+            .str.replace_all(emoji_removal_regex, "") # usuwanie emocji
+            .map_elements(lambda x: langid.classify(x)[0], # klasyfikacja języka
+                          return_dtype=pl.String))
+          .cast(pl.Categorical)
+          )
+
+  return data
+
+```
+
+```{python}
+#| echo: false
+
+# zcacheowane wyniki obliczeń
+language = pl.read_csv("src_files/data/language.csv")["Language"]
+
+display(
+  Markdown(
+    f"W zbiorze danych występuje **{language.n_unique()}** Unikalnych języków"
+  )
+)
+```
+
+Sugeruje to dużą różnorodność danych. Jednak trzeba sprawdzić róznież rozkład języków, ponieważ może się zdarzyć, że jeden język dominuje ponad resztą.
+
+```{python}
+#| warning: false
+#| fig-cap: Wykres pokazujący 10 najczęsciej występującyh języków w komentarzach.
+#| label: fig-lang
+top10_lang = language.value_counts(sort=True)[:10]
+
+(pltn.ggplot(top10_lang) +
+ pltn.aes("reorder(Language, count, ascending=False)",
+           "count",
+          fill="Language") +
+ pltn.geom_col() +
+ pltn.scale_y_log10()+
+ pltn.labs(title="Najpopularniejsze języki w zbiorze danych",
+           x="Język", y="Liczba komentarzy (log10)") +
+ pltn.theme(legend_position="none"))
+
+
+```
+
+
+```{python}
+#| echo: false
+#| 
+display(
+  Markdown(
+    f"Według @Fig-lang, komentarze są  **{len(language.filter(language == "en")) / len(language) *100:.2f}%** w języku angielskim. Jest to duża dysproporcja w porównaniu z innymi językami. Najlepszy posunięciem przez to będzie zawężenie zakresu analizy do angielskojęzycznych komentarzy."
+    )
+)
+```
+
+### Proces Etykietowania
+W tej analize zastosowano dyskretny model emocji, który przyporządkowuje każdemu komentarzowi jedną kategorię emocji. Za bazę przyjęto model emocji Ekmana (złość, strach, smutek, radość, obrzydzenie, zaskoczenie), który następnie dostosowano na potrzeby rodzaju zasobu - komentarzy na serwisie Youtube, dodając kategorie ciekawość wdzięczność i sarkazm. Emocje niepasujące do danych zostały nieuwzględnione (strach, obrzydzenie i zaskoczenie).  [@plaza-del-arco_emotion_2024]
+Użyto techniki [zero-shot-classification](https://huggingface.co/tasks/zero-shot-classification), dzięku której zachowano kontrolę nad tym jakie emocje klasyfikowano, bez potrzeby uprzedniego trenowania modelu, oraz zwracane były prawodpodobieństwa klas, które łatwo można było "połączyć". By zapewnić niezależność predykcji od wykorzystanego modelu zastosowano [Ensenble Learning](https://neptune.ai/blog/ensemble-learning-guide). Wykorzystane modele:
+
+- [bart-large-mnli](https://huggingface.co/facebook/bart-large-mnli) zkwantyzowanego do liczb półprecyzyjnych. [@lewis_bart_2019]
+- [DeBERTa-v3-base-mnli](https://huggingface.co/MoritzLaurer/DeBERTa-v3-base-mnli) [@he_debertav3_2023]
+
+Prawdopodobieństwa połączono używając średniej dla każdej klasy, następnie wybrano najprawdopodobne z nich.
+
+$$
+  P(E_i) = \frac{p_{i1} + p_{i2}}{2}
+$$
+gdzie:
+
+- $P(E_I)$ - prawdopodobieństwo że komentarz wyraża $i$-tą emocję.
+- $p_{i1}, p_{i2}$ - prawdopobieństwa $i$-tej emocji przewidziane przez modele.
+
+Przed inferencją wstępnie przetworzono komentarze. Usunięto niewygodne fragmenty (czyli `</s>` interpretowany przez tokenizator jako token `EOS`). Emotikony zamieniono na ich tekstowe odpowiedniki, np. ❤️ -> `:heart:`, 😄 -> `:smile:`. Dzieki temu zachowano przydatne informacje, które mogły być pomocne podczas przewidywania emocji. Wykorzstano w tym celu bibliotekę [emojis](https://emojis.readthedocs.io/en/latest/index.html).
+
+## Analiza Eksploracyjna
+### Brakujące dane
+Jak zauważono w @sec-dataset, oryginalne zbiór danych już był procesowny, przez co nie powinno być zbyt wiele braków danych.
+
+```{python}
+#| echo: false
+#| tbl-cap: "Tablica pokazująca liczbę brakujących danych w każdej kolumnie"
+#| label: tbl-nans
+GT(data.null_count())
+```
+
+Jak pokazuje @tbl-nans, `AuthorName` jest jedyną kolumną z brakami w danych. Ta cecha nie daje nam żadnych przydatnej infromacji o emocji wyrażonej w komentarzu, więc nie potrzebuje ona ani usunięca ani wypełnienia.
+
+### Miejsca publikacji {#sec-places}
+
+Informacja o lokacji daje nam przydatny kontekst o komentarzu. Jeżeli większość komentarzy pochodziłaby z jednego kraju, wtedy zbiór nie byłby reprezentatywny dla reszty świata. Wykres poniżej pokazuje miejsca skąd zostały opublikowane komentarze. Komentarze są po angielsku, więc wiekszość miejsc powinna być z krajów anglojęzycznych, warto jednak zauważyć, że angielski jest językiem powszechnie używanym w internecie, także przez osoby pochodzące z nie anglojęzycznych krajów.
+```{python}
+#| label: fig-map
+#| fig-cap: Liczba komentarzy opublikowanych w danych krajach
+country_codes = {
+    "GB": "GB1",
+    "DE": "DEU",
+    "NZ": "NZ1",
+    "CA": "CAN",
+    "AU": "AU1",
+    "IE": "IRL",
+    "US": "US1",
+    "IN": "IND",
+    "PH": "PHL",
+}
+
+# liczby krajów + zamienienie ich na trzylterowe skróty do późniejszego joina
+country_counts = (
+  data["CountryCode"]
+  .value_counts()
+  .with_columns(
+    SOV_A3 = pl.col("CountryCode")
+    .replace_strict(country_codes, return_dtype=pl.String)
+  )
+  .to_pandas()
+)
+
+url = "https://naturalearth.s3.amazonaws.com/50m_cultural/ne_50m_admin_0_countries.zip"
+world = gpd.read_file(url)
+
+# połączenie krajów z mapą
+world = (world
+  .merge(country_counts,
+    on="SOV_A3", 
+    how="left")
+  .fillna(
+    value = {
+      "count": 0
+    }
+))
+
+#  usuwak antarktykę bo nikt tam nie mieszka + potrzebuje miejsca
+world = world[world["SOVEREIGNT"] != "Antarctica"]
+
+# najtrudniejszy wykres w moje "karierze" btw
+(pltn.ggplot(world) +
+  pltn.aes(fill = "count") +
+  pltn.geom_map() +
+  #pltn.coord_fixed(expand=False) +
+  pltn.theme_void() +
+  pltn.scale_fill_continuous(
+        name="Liczba komentarzy",
+        #cmap_name="RdYlGn_r"
+        cmap_name="Blues"
+  ) +
+  pltn.theme(
+    figure_size=(8,5),
+    legend_position="inside",
+    legend_position_inside=(0.1, 0.15),
+    legend_background= pltn.element_rect("white"),
+    legend_box_margin= 5,
+    
+    plot_background=pltn.element_rect("white"),
+    plot_margin_top=-0.02,
+    plot_margin_bottom=-0.03,
+    plot_margin_left=-0.05,
+    plot_margin_right=-0.05
+  ) +
+  pltn.labs(
+    title="Liczba komentarzy opublikowanych w danych krajach"
+  )
+)
+```
+
+@fig-map pokazuje zaskakującą niską różnorodność pod względem lokalizacji. Ogromna część komentarzy pochodzi z krajów anglojęzycznych (np. USA, Wielka Brytania, Kanada), sugeruje to zachodnio-centryczność poruszanych tematów.
+
+### Daty publikacji {#sec-dates}
+
+Kolejną zmienną dającą dużo kontekstu na temat zbioru danych jest `PublishedAt`, która przechowuje informacje o czasie publikacji kometarza. Tematy mogą się znacząco różnić od trendów w danym czasie, zwłaszcza jeśli chodzi o tematy polityczne/newsy.
+
+```{python}
+#| echo: false 
+data = (data
+  .with_columns(PublishedAt = pl.col("PublishedAt")
+  .str.to_datetime("%Y-%M-%d %H:%M:%S")
+  )
+)
+
+display(
+  Markdown(
+    f"Komentarze były publikowane od **{data["PublishedAt"].min().strftime("%d.%m.%Y")}** do **{data["PublishedAt"].max().strftime("%d.%m.%Y")}**"
+  )
+)
+```
+
+Jest to dosyć szeroki przedział, by jednak zyskać pełną informacje o datach potrzebne są informacje o rozkładzie tych dat.
+
+```{python}
+#| label: fig-years
+#| fig-cap: Wykres pokazujący liczbę komentarzy opublikowanych w danym roku
+
+(
+  pltn.ggplot(data
+              .with_columns(Year = pl.col("PublishedAt").dt.year())
+              .group_by(pl.col("Year"))
+              .len()
+              ) +
+  pltn.aes("Year", "len") +
+  #pltn.scale_color_manual(values=("blue")) +
+  #pltn.geom_bar(fill="#2780e3") +
+  pltn.geom_line(color="#2780e3") +
+  #pltn.geom_area(fill="#bbd7f6") +
+  pltn.geom_point(color="#2780e3") + 
+  pltn.scale_y_continuous(
+    labels= custom_data_formatter
+  ) +
+  pltn.scale_x_continuous(
+    breaks = range(2013, 2026)
+  ) +
+  pltn.labs(
+    title="Liczba komentarzy opublikowana w danym roku",
+    y="Liczba komentarzy",
+    x="Rok"
+  )
+)
+```
+
+Jak pokazuje @fig-years, duża część komentarzy została opublikowana w 2025. A ponieważ większość najdalszą datą publikacji komentarze jest 27 styczeń 2025, to oznacza że spora część komentarzy pochodzi tylko z jednego miesiąca. Sugeruje to małą różnorodność tematów, zwłaszcza jeżeli chodzi o kategorię polityczną. Warto zauważyć, że w styczniu 2025 roku odbyły się wybory na prezydenta USA, zważając na to że duża część komentarzsy pochodzi z USA, można podejrzewać że kategoria polityczne będzie zdominowana przez to wydarzenie.
+
+
+### Unikalne wideo
+
+Liczba unikalnych wideo pozwoli określić jak reprezentatywny jest zbiór danych wobec komentarzy na Youtube. Najlepszym przypadkiem byłoby gdyby komentarze pochodziły z wielu wideo, ponieważ gwarantowałoby to dużą różnorodność komentarzy.
+
+```{python}
+#| echo: false
+display(
+  Markdown(
+    f"Mamy **{len(data["VideoID"].unique())}** unikalnych wideo. Co oznacza, że mamy przeciętnie **{len(data)/data["VideoID"].n_unique():.1f}** komentarzy na wideo."
+    )
+)
+```
+
+
+Jest to dobry sygnał. Jednak nie daje on pełnej informacji. Jest szansa, że wieszkość komentarzy pochodzi od kilkunastu-kilkudziesiąt filmików, natomiast reszta są to wideo z kilkoma komentarzami. Trzeba zbadać rozkład.
+
+```{python}
+#| fig-cap: Rozkład liczby komentarzy na wideo
+#| label: fig-video-per-comment
+#| warning: false
+comments_per_video = (data
+                      .group_by("VideoID")
+                      .len())
+
+(
+  pltn.ggplot(comments_per_video) +
+  pltn.aes("len") +
+  pltn.geom_histogram(fill="#2780e3") +
+  pltn.labs(
+    title = "Rozłożenie liczby komentarzy w każdym wideo",
+    x = "Liczba komentarzy na wideo",
+    y= "Liczba wystąpień"
+  )
+)
+
+```
+Według @fig-video-per-comment, wiekszość widoe ma po ~200 komentarzy. Zadziwiająca jest lewostronna asymetria rozkładu. Być może wiążę się to z limitami API Youtube-a podczas zbierania.
+
+### Unikalni Autorzy
+
+Podobnie jak w przypadku wideo, reprezentatywny zbiór danych powinien zawierać jak najwięcej autorów komentarzy, by przedstawiać różne style pisania oraz różne sposoby wyrażania emocji. Określenie liczby autorów oraz liczby napisanych przez nich komentarzy pomoże również w zidentyfikowaniu botów/spamu, który może się pojawiać w komentarzach.
+
+```{python}
+#| echo: false
+#| 
+unique_authors = data["AuthorChannelID"].n_unique()
+display(
+  Markdown(
+    f"Liczba autorów w zbiorze **{unique_authors}**. Co oznacza, że przeciętnie jest  **{len(data) / unique_authors:.2f}** komentarzy na autora."
+  )
+)
+```
+
+Jest to dosyć dobrze prognozująca liczba. Teraz by zidentifikować boty, należy sprawdzić najczęściej występujących autorów w komentarzach.
+
+```{python}
+#| tbl-cap: Najczęściej występujący autorzy w Komentarzach
+#| label: tbl-common-authors
+
+GT(
+  data
+  .group_by(pl.col("AuthorChannelID"))
+  .agg([
+    pl.col("AuthorName").first(),
+    pl.len().alias("count")
+  ])
+  .sort(by="count", descending=True)
+  .head(10)
+  .select(
+    pl.col("AuthorName").alias("Autor"),
+    pl.col("count").alias("Liczba komentarzy"))
+).cols_align(align="center", columns="Liczba komentarzy")
+```
+
+
+Według @tbl-common-authors, najczęstszy autor komentarzy napisał tylko 131. Zauważając że jest to autok kanału, to nie jest to podejrzane. Reszta najczęściej występujących autorów została manualnie sprawdzona i również jaczęściej są to autorzy filmów występujących w danych. Zatem można orzec, że w zbiorze nie występują masowy spam.
+
+## Analiza Emocji
+
+### Charakterystyka emocji {#sec-emocje}
+Analizy komentarzy nie da się przeprowadzić bez badania ich treści. Ich dokładny przegląd pozwoli na porównanie ze sobą emocji oraz zidentyfikowanie ewentualnych trudności przy ich klasyfikacji.
+Poniżej przedstawiono rozkład emocji w komentarzach.
+
+```{python}
+#| label: fig-emo-freq
+#| fig-cap: Częstości emocji w zbiorze danych
+(
+  pltn.ggplot(
+    data
+  )
+  + pltn.aes("reorder(Emotions, Emotions, len, ascending=True)", 
+             fill="Emotions")
+  + pltn.geom_bar()
+  + pltn.coord_flip()
+  + pltn.scale_y_continuous(
+    labels=custom_data_formatter
+  )
+  + pltn.labs(
+    title="Rozkład emocji w komentarzach",
+    x="Emocje",
+    y="Liczba komentarzy"
+  )
+)
+```
+
+@fig-emo-freq pokazuje, że zbiór danych nie jest zbalansowany pod względem dominujących emocji.
+```{python}
+
+display(
+    Markdown(
+        f"Dominuje tutaj Ciekawość (**{len(data.filter(pl.col("Emotions") == "Ciekawość"))/len(data) * 100:.1f}%**) oraz Radość (**{len(data.filter(pl.col("Emotions") == "Radość"))/len(data) * 100:.1f}%**)"
+    )
+)
+```
+Dlatego podczas trenowania modelu należy sprawdzić również inne metryki niż dokładność, przydatna może być $F1$-score.
+
+Warto zauważyć, że niektóre Emocje wyrażane w tekście mogą być bardziej podobne do innych. Na przykład nietrudnych założeniem jest to, że komentarze wyrażające wdzięczność będą bardziej podobne do tych wyrażających radość niż do tych przedstawiających złość. 
+
+W celu porównania emocji wyliczono wektory osadzeń dla każdego komentarza, przy użyciu modelu `all-MiniLM-L6-v2`. Wektory następnie pogrupowano według emocji i wyliczono dla grup centroidy, które następnie porównano za pomocą dystansu cosinusowego.
+
+```{python}
+#| fig-cap: Macierz dystansu pomiędzy różnymi emocjami
+#| label: fig-emo-dist
+emotions_distance_matrix = pl.read_csv("src_files/data/emotions_distance_matrix.csv")
+
+(pltn.ggplot(
+  emotions_distance_matrix
+      .unpivot(pl.selectors.numeric(), index="Emocje")
+      .with_columns(Dystans = pl.col("value").round(3))
+      )
+  + pltn.aes("factor(Emocje)", "factor(variable)", fill="Dystans")
+  + pltn.geom_tile()
+  + pltn.geom_text(
+      pltn.aes(label="Dystans"), 
+      size=11, 
+      show_legend=False, 
+      color="white")
+  + pltn.scale_fill_continuous(limits=[0., 1.], expand=(0,1))
+  + pltn.theme(
+    axis_text_x= pltn.element_text(angle = 90, hjust = 1, size=11),
+    axis_text_y = pltn.element_text(size=11),
+    axis_title=pltn.element_blank(),
+    axis_ticks=pltn.element_blank(),
+    panel_background=pltn.element_rect(fill="white"),
+    figure_size=(8, 7.5)
+  )
+  + pltn.labs(
+    title="Macierz dystansu centroidów emocji"
+  )
+)
+```
+
+Jak pokazuje @fig-emo-dist, między emocjami występują wyraźne różnice semantyczne, szczególnie wyraźne są one na na linii sentymentów (emocji pozytywnych i negatywnych). Najbardziej wyróżniającą się emocją jest wdzięczność (Jedynie jest ona podobna nieco do radości). Niektóre centroidy są też bardzo blisko siebie, dotyczy to głównie grupy emocji ciekawości, neutralności i sarkazmu.
+
+Poniżej przedstawiono najczęściej występujące słowa w każdej kategorii.
+
+```{python}
+#| warning: false
+common_words_emotions = pl.read_csv("src_files/data/common_words_emotions.csv")
+
+def generate_wordcloud(
+  df: pl.DataFrame,
+  col: str,
+  key: str,
+  *args, **kwargs
+  ) -> wordcloud.WordCloud:
+
+  most_common_dict: dict[str, int] = {
+    word: freq for _, word, freq in (df
+    .filter(pl.col(col) == key)
+    .iter_rows()
+    )
+  }
+
+
+  word_plot = wordcloud.WordCloud(
+    max_words=100,
+    background_color="white",
+    height=750,
+    width=1000,
+    random_state=34,
+    *args, **kwargs
+    ).generate_from_frequencies(most_common_dict)
+
+  return word_plot
+
+```
+
+::: {.panel-tabset}
+## Złość
+
+```{python}
+#| fig-align: center
+plt.imshow(
+  generate_wordcloud(
+    common_words_emotions,
+    "Emotions",
+    "anger",
+    color_func=create_color_pallete(emotion_colors["Złość"])
+  )
+)
+plt.axis("off")
+plt.show()
+```
+
+## Wdzięczność
+
+```{python}
+#| fig-align: center
+plt.imshow(
+  generate_wordcloud(
+    common_words_emotions,
+    "Emotions",
+    "gratitude",
+    color_func=create_color_pallete(emotion_colors["Wdzięczność"])
+  )
+)
+plt.axis("off")
+plt.show()
+```
+
+## Smutek
+
+```{python}
+#| fig-align: center
+plt.imshow(
+  generate_wordcloud(
+    common_words_emotions,
+    "Emotions",
+    "sadness",
+    color_func=create_color_pallete(emotion_colors["Smutek"])
+  )
+)
+plt.axis("off")
+plt.show()
+```
+
+## Sarkazm
+
+```{python}
+#| fig-align: center
+plt.imshow(
+  generate_wordcloud(
+    common_words_emotions,
+    "Emotions",
+    "sarcasm",
+    color_func=create_color_pallete(emotion_colors["Sarkazm"])
+  )
+)
+plt.axis("off")
+plt.show()
+```
+
+## Radość
+
+```{python}
+#| fig-align: center
+plt.imshow(
+  generate_wordcloud(
+    common_words_emotions,
+    "Emotions",
+    "joy",
+    color_func=create_color_pallete(emotion_colors["Radość"])
+  )
+)
+plt.axis("off")
+plt.show()
+```
+
+## Neutralność
+```{python}
+#| fig-align: center
+plt.imshow(
+  generate_wordcloud(
+    common_words_emotions,
+    "Emotions",
+    "neutral",
+    color_func=create_color_pallete(emotion_colors["Neutralność"])
+  )
+)
+plt.axis("off")
+plt.show()
+```
+
+## Ciekawość
+```{python}
+#| fig-align: center
+plt.imshow(
+  generate_wordcloud(
+    common_words_emotions,
+    "Emotions",
+    "curiosity",
+    color_func=create_color_pallete(emotion_colors["Ciekawość"])
+  )
+)
+plt.axis("off")
+plt.show()
+```
+:::
+
+Niektóre emocje charakteryzują się pewnymi słowami kluczami które występują o wiele częściej niż inne. Takimi słowami są np. `thank` dla wdzięczności oraz `love` dla Radości.
+Jednak wyszukiwanie takich słów jedynie za pomocą ich ilości wystąpień w danej kategorii ogranicza zakres wyszukiwania jedynie do najczęsciej występujących słów.
+By lepiej zobrazować zależności słów między emocjami wykorzystani współczynnik $nPMI$ @bouma_normalized_nodate. Współczynnik ten definiuje sie za pomocją wzoru:
+$$
+\text{nPMI}(E_i, W_j) = \frac{\log_2\left(\frac{P(W_j \cap E_i)}{P(E_i) P(W_j)}\right)}{-\log_2 P(W_j \cap E_i)}
+$$
+gdzie:
+
+- $W_j$ oznacza zdarzenie polegające na natknięciu się $j$-tego słowa w komentarzu
+- $E_i$ oznacza zdarzenie że dany komentarz wyraża $i$-tą emocję
+
+```{python}
+pmi = pl.read_csv("src_files/data/pmi.csv")
+
+df  = pl.DataFrame()
+TOP_K = 10
+
+for emo in pmi["Emotions"].unique():
+    df = df.with_columns(
+        pmi
+        .filter(pl.col("Emotions") == emo)
+        .top_k(TOP_K, by = pl.col("PMI"))
+        .select(
+            pl.col("Word").alias(f"{emo}_words"),
+            pl.col("PMI").round(3).alias(f"{emo}_pmi")
+            
+        )
+    )
+gt = GT(df)
+for emo in pmi["Emotions"].unique():
+  gt = gt.tab_spanner(emo, [f"{emo}_words", f"{emo}_pmi"])
+
+gt.cols_label(
+  **{
+   f"{emo}_words": "Słowo" for emo in pmi["Emotions"].unique()
+  },
+  **{
+    f"{emo}_pmi": md("PMI") for emo in pmi["Emotions"].unique()
+  }
+)#.cols_align(align="center")
+
+```
+
+Słowami o największym `nPMI` są słową wyraźnie nacechowanie emocjonalnie. Występowanie słów często występujących w danej emocji, wskazuje na to że do klasyfikacji można wykorzystać modele probabilistyczne, np naiwny klasyfikator Bayesa. Szczególnie ten sposób do problemu może być dobry dla wdzięczności, gdzie słowa o lemacie `thank` są bardzo silnie związane z tą kategorią.
+
+### Długość komentarzy a Emocje
+
+Interesującą hipotezą do sprawdzenia jest to, że rozkład długości komentarza będzie się różnił w zależności od emocji w nim wyrażanej. Np. być może najdłuższe są komentarze wyrażające gniew, ponieważ jest to silna emocja, natomiast neutralnie emocjonalnie komentarze powinny być najkrótsze.
+
+Naturalnym sposobem mierzenia długości tekstu jest rozpatrywanie jego w długości znaków/wyrazów. Jednak biorąc pod uwagę cel tej analizy owiele lepszym sposobem jest rozpatrywanie długosci tekstu, tak jak widzą ją duże modele językowe, czyli poprzez tokeny. Rozwiązanie to jest również wygodne ponieważ przy doborze odpowiedniego tokenizatora pozwala również na kodowanie emotek. Do szybkiego tokenizowania tekstu została wykorzystana biblioteka [tokenizers](https://huggingface.co/docs/tokenizers/index) od Hugging Face.
+
+Do tokenizacji użyto tokenizatora modelu RoBERTa-base [@liu_roberta_2019], ze względu na jego wsparcie na enkodowanie emotek oraz duży zasób słownictwa (50,000 tokenów). Blok kodu poniżej pokazuje proces kalkulacji długości komentarzy w tokenach.
+
+```{python}
+tokenizer = Tokenizer.from_pretrained("FacebookAI/roberta-base")
+
+lengths = data["CommentText"].to_list()
+
+#tokenizacja tekstu w batchach
+lengths = tokenizer.encode_batch_fast(lengths)
+
+#obliczanie długości komentarza w tokenach
+lengths = [len(encoding.ids) for encoding in lengths]
+
+#dodanie odpowiedniej kolumny do danych
+data = (data
+        .with_columns(
+          TokenLength = pl.Series(lengths)
+        )
+)
+
+```
+
+::: {.panel-tabset}
+
+## Tabela
+```{python}
+#| tbl-cap: Tabela pokazujące podstawowe statystyki Długości
+#| label: tbl-lengths
+GT(data
+#.filter(pl.col("Language") != "en")
+.group_by("Emotions")
+.agg(
+  pl.col("TokenLength").median().alias("Mediana"),
+  pl.col("TokenLength").mean().round(2).alias("Średnia"),
+  pl.col("TokenLength").std().round(2).alias("Odchylenie Standardowe")
+)
+).cols_align(align="center")
+```
+
+@tbl-lengths pokazuje niewielkie róznice w medianie długości komentarzy. Ciekawa jest róznież różnica pomiędzy medianą i średnią, które może wskazywać na asymetrię rozkładu. W zbiorze zatem dominują krótkie komentarze, ale zdarzają się również komentarze-rozprawki.
+
+## Wykres
+```{python}
+#| fig-cap: Tabela pokazująca rozkład długości w podziale na emocje
+#| label: fig-lengths
+(
+  pltn.ggplot(data) +
+  pltn.aes(x="Emotions",y="TokenLength" ,fill = "Emotions") +
+  pltn.geom_boxplot(outlier_shape = None) +
+  pltn.labs(
+    x="Emocja",
+    y="Długość komentarza",
+    title="Rozkład Długości komentarz w podziale na Emocje"
+  ) +
+  scale_emotions_fill
+
+)
+
+```
+Boxy się nakładają, co sugeruje że rozkłady nie są różne. Ciekawe jest również to, że górny wąs jest o wiele dłuższy od dolnego co wskazuje na duże zróżnicowanie w długości komentarzy.
+
+::: 
+
+By sprawdzić relację między długością komentarza a wyrażaną przez niego emocjię, konstruujemy następujące hipotezy:
+
+- $H_0$ - Meiany długości komentarzy jest taka sama dla wszystkich Emocji.
+- $H_1$ - Co najmniej jedna mediana długości komentarzy jest inna dla jakiejś Emocji
+
+By przetestować te hipotezy użyjemy [Testu Kruskal-Wallis'a](https://en.wikipedia.org/wiki/Kruskal%E2%80%93Wallis_test#). Ze względu na dużą  próbę przyjmiemy poziom istotności $\alpha = 0.0001$. Jednym z problemów testowania hipotez dla zbiorów jest to że: *"Sometimes a statistically significant result means only that a huge sample size was used"*, jak zauważono w [@sullivan_using_2012]. By temu zaradzić wyliczono również wskaźnik siły efektu $\eta^2$, który pokaże bardziej *praktyczną* istotność od tej *statystycznej*. Wstaźnik ten obliczamy wzorem:
+$$
+\eta^2 = \frac{H-k+1}{n-k}
+$$
+gdzie:
+
+- $H$ - wartość testu statystycznego kruskal wallis
+- $k$ - liczba grup
+- $n$ - liczba obserwacji
+
+Jak podano w [@tomczak_need_2014]
+
+```{python}
+#| warning: false
+#| label: test-kruskal
+
+alpha = 0.0001
+result = kruskal(*[
+  emo["TokenLength"].to_numpy() for emo in data.partition_by("Emotions")
+], nan_policy="omit")
+
+num_emo = data["Emotions"].n_unique()
+eta = (result.statistic - num_emo + 1)/(len(data)-num_emo)
+
+if result.pvalue < alpha:
+  hyp_result = "Można odrzucić $H_0$."
+else:
+  hyp_result = "Nie mozna odrzucić $H_0$"
+
+display(
+  Markdown(
+    f"wartość $p$ { "<" if result.pvalue < alpha else ">"} {alpha} <br>$\eta^2$: {eta:.4f} <br>{hyp_result}"
+  )
+)
+
+```
+
+Wartości $p$ jest mniejsza od poziomu istotności $alpha$ co pozwala na odrzucenie hipotezy zerowej.
+Bardziej ciekawą informacje daje $\eta^2$. Jego wartość jest w przedziale $[0.01, 0.06]$, zatem można uznać że siłę efekty za słabą [@noauthor_faqeffectsize_nodate]. Zatem różnice w długościach komentarzy istnieją, jedak są one niewielkie.
+
+Zatem model nie powinien zgadywać emocji komentarza na podstawie tylko jego długości.
+
+### Polubienia i odpowiedzi a wyrażane emocje
+
+Kolejną relają wartą zbadania jest zależność między odpowiedziami/polubieniami a emocją. Np. Komentarze wyrażające wdzięczność powinny mieć więcej reakcji niż te wyrażające neutralne emocje. Najpierw należy jendak sprawdzić ile komentarzy ma jakiekolwiek reakcje. 
+
+```{python}
+#| echo: false
+display(
+  Markdown(
+    f"**{len(data.filter(pl.col("Likes") > 0)) / len(data) * 100:.2f}%** komentarzy ma przynajmniej jendo polubienie, **{len(data.filter(pl.col("Replies") > 0)) / len(data) * 100:.2f}%** komentarzy ma przynajmniej jedną odpowiedź."
+  )
+)
+```
+Większość komentarzy nie ma ani jednego polubienia ani odpowiedzi, dlatego zdyskretyzowano liczbę polubień i odpowiedzi do tego czy dane komentarze posiadają reakcje. Do sprawdzenia związku pomiędzy cechami użyjeto testu $\chi^2$ dla niezależności prób. Do interpretacji wyników wykorzystano również siłę efekty $V$ Cramer'a.
+
+```{python}
+data = (
+  data
+  .with_columns(
+    pl.when(pl.col("Likes") > 0).then(pl.lit("Polajkowany"))
+    .otherwise(pl.lit("Nie Polajkowany"))
+    .cast(pl.Categorical).alias("IsLiked"),
+    pl.when(pl.col("Replies") > 0).then(pl.lit("Ma odpowiedzi"))
+    .otherwise(pl.lit("Nie Ma Odpowiedzi"))
+    .cast(pl.Categorical).alias("IsReplied")  
+  )
+)
+
+#GT(
+#  data
+#  .group_by(
+#    pl.col("IsLiked"), pl.col("IsReplied")
+#  )
+#  .len()
+#  .pivot(on="IsLiked", index="IsReplied")
+#
+#)
+```
+
+::: {.panel-tabset}
+
+## Polubienia
+Konstruujemy następujące hipotezy:
+
+- $H_0$ - Emocje wyrażanie w komentarzach oraz to czy komentarz został polubiony jest bez związku.
+- $H_1$ - Emocje wyrażanie w komentarzach oraz to czy komentarz został polubiony ma związek ze sobą.
+
+```{python}
+
+contingency_table = (
+  data
+  .group_by(
+    pl.col("Emotions"),
+    pl.col("IsLiked")
+  )
+  .len()
+  .pivot(on="Emotions", 
+         index ="IsLiked")
+  .rename({"IsLiked": "Czy polajkowany"})
+)
+
+GT(contingency_table).cols_align(align="center")
+```
+Największe różnice występują w emocjach ciekawości, sarkaźmie i co ciekawe w neutralnie emocjonalnych komentarzach.
+```{python}
+alpha = 0.0001
+result = chi2_contingency(
+  contingency_table.select(pl.selectors.numeric()).to_numpy(), 
+  correction=False)
+
+V = np.sqrt(result.statistic / (len(data)))
+
+if result.pvalue < alpha:
+  hyp_result = "Można odrzucić $H_0$."
+else:
+  hyp_result = "Nie mozna odrzucić $H_0$"
+
+
+display(
+  Markdown(
+    f"wartość $p$ { "<" if result.pvalue < alpha else ">"} 0.0001 <br>$V$ Cramera: {V:.5f} <br>{hyp_result}"
+  )
+)
+```
+
+Wartość $p$ jest mniejsza od wcześniej ustalonego poziomu istotności $\alpha$, można odrzucić przez to hipotezę zerową. O wiele więcej informaji w tym wypadku da $V$ Cramera. Jego wartość sugeruje słabe powiązanie, według interpretacji [@rea_designing_2014].
+
+## Odpowiedzi
+Konstruujemy następujące hipotezy:
+
+- $H_0$ - Emocje wyrażanie w komentarzach oraz to czy komentarz ma odpowiedzi jest bez związku.
+- $H_1$ - Emocje wyrażanie w komentarzach oraz to czy komentarz ma odpowiedzi ma związek ze sobą.
+
+```{python}
+
+contingency_table = (
+  data
+  .group_by(
+    pl.col("Emotions"),
+    pl.col("IsReplied")
+  )
+  .len()
+  .pivot(on="Emotions", 
+         index ="IsReplied")
+  .rename({"IsReplied": "Czy posiada odpowiedzi"})
+)
+
+GT(contingency_table).cols_align(align="center")
+```
+
+
+Ze względu na duże różnice w liczbie między komentarzami z odpowiedziami i bez, cięzko znaleźć największe dysproporcje. 
+```{python}
+alpha = 0.0001
+result = chi2_contingency(
+  contingency_table.select(pl.selectors.numeric()).to_numpy(), 
+  correction=False)
+
+V = np.sqrt(result.statistic / (len(data)))
+
+if result.pvalue < alpha:
+  hyp_result = "Można odrzucić $H_0$."
+else:
+  hyp_result = "Nie mozna odrzucić $H_0$"
+
+
+display(
+  Markdown(
+    f"wartość $p$ { "<" if result.pvalue < alpha else ">"} 0.0001 <br>$V$ Cramera: {V:.5f} <br>{hyp_result}"
+  )
+)
+```
+
+Ponownie wartość $P$ pozwala na odrzucenie hipotezy zerowej i przyjęcie $H_1$ jako prawdziwej. Wartość siły efektu $V$ sugeruje nieistotną związek pomiędzy odpowiedziami. [@rea_designing_2014]
+:::
+
+Oba testy sugerują małą lub wręcz nieistotną zależność między zmiennymi. Warto jednak pamiętać, że powyższe testy nie biorą pod uwagę tego jak został przyjęty sam film. Na przykład komentarzy pod filmem, który był negatywnie przyjęty przez użytkowników serwisu, wyrażające krytykę (czyli też zazwyczaj negatywne emocje) będą częściej polubiane niż te broniące autora. i *vice versa*. W zbiorze danych brakuje metadanych o tym jak został przyjęty film.
+
+### Kategorie Wideo
+
+Cechą dającą dużo informacji o kontekście komentarzy jest `CategoryID`. Przedstawia wewnętrzną klasyfikację tematy filmu od API Youtube'a. Prawdopodobnym wydaje się hipoteza, że inne emocje bedą dominowały pod filmami o zwierzętach a pod politycznymi video. 
+
+```{python}
+data  = (data
+    .with_columns(
+        pl.col("CategoryID")
+        .map_elements(category_dict.get, return_dtype=pl.String)
+        .cast(pl.Categorical)
+    )
+)
+```
+
+
+```{python}
+#| label: fig-categories
+#| fig-cap: Wykres pokazujący rozkład liczby komentarzy danej kategorii w zbiorze danych
+counts = data["CategoryID"].value_counts(normalize=True).sort("proportion")
+
+rects = (pl.DataFrame(squarify.squarify(counts["proportion"], 0, 0, 1, 1))
+	.with_columns(
+		Kategoria = pl.Series(counts["CategoryID"].to_list()),  # zmienianie z series do listy i potem do series durne ale działa
+		proportion = (counts["proportion"] * 100).round(2).cast(pl.String) + "%"
+		)
+	)
+
+(pltn.ggplot(
+	rects
+	) 
+	+ pltn.geom_rect(
+		pltn.aes(
+			xmin = "x",
+			ymin = "y",
+			xmax = "x+dx",
+			ymax = "y+dy",
+			fill = "Kategoria"
+		),
+		color="white",
+		
+	)
+	+ pltn.geom_text(pltn.aes(
+		x="x+0.5*dx",
+		y="y+0.5*dy",
+		label="proportion",
+		#
+	), color="white")
+	+ pltn.coord_equal()
+	+ pltn.theme_void()
+	+ pltn.labs(title="Rozłożenie Kategorii Wideo")
+	#+ pltn.theme(legend_position='bottom')
+)
+```
+Wykres @fig-categories pokazuje dużą dysproporcje pomiędzy różnymi kategoriami.
+```{python}
+display(
+  Markdown(
+    f"Na przykład, komentarze polityczne stanowią **{len(data.filter(pl.col("CategoryID") == "Wiadomości i polityka"))/len(data)*100:.2f}%** kometarzy, natomiast edukacja zajmuje **{len(data.filter(pl.col("CategoryID") == "Edukacja"))/len(data)*100:.2f}%** zbioru danych."
+  )
+)
+```
+Niezbalansowanie danych pod względem kategorii filmów, może się okazać problemem podczas próby wytrenowania modelu do predykcji emocji. 
+
+W tabeli poniżej przedstawiono proporcje emocji w każdej kategorii. Kategorie posortowano według niezbalansowania pod względem wyrażanych emocji. By móc to zrobić użyto entropi $H_7(C)$, zdefiniowaną jako:
+$$
+H_7(C) = - \sum  p_i \log_7(p_i)
+$$
+gdzie:
+
+- $H_7(C)$ - znormalizowana entropia kategorii $C$
+- $p_i$ - proporcja występowania $i$-tej emocji w kategorii $C$
+
+Podstawa logarytmu (równa liczbie emocji) gwarantuje, że $H_7(C) \in \left[ 0,1\right]$.
+
+
+```{python}
+#| label: tbl-categories
+#| tbl-cap: Tabela pokazująca proporcje emocji w danych kategoriach
+def entropy(x):
+  entropy = 0
+  for prob in x.values():
+    entropy += -prob * np.log(prob) / np.log(7)
+  return entropy
+(
+GT(
+  data
+  .group_by("Emotions", "CategoryID")
+  .len()
+  .with_columns(
+    (pl.col("len") / pl.col("len").sum()).over("CategoryID")
+  )
+  .pivot(
+    on="Emotions",
+    index="CategoryID"
+  )
+  .with_columns(
+    pl.struct(pl.all().exclude([pl.Categorical]))
+    .map_elements(entropy, return_dtype=pl.Float64)
+    .alias("Entropia")
+  )
+  .sort("Entropia"),
+  rowname_col="CategoryID"
+)
+  .fmt_percent(data["Emotions"].unique().to_list(), decimals=2)
+  .fmt_number("Entropia", decimals=3)
+  .tab_stubhead("Kategorie")
+  .tab_header(
+    title=md("Rozłożenie emocji w poszczególnych kategoriach wideo")
+  )
+  .tab_style(
+    style  = style.borders(
+      sides = ["left"],
+      color="gray",
+      style="dashed", 
+      weight="3px"),
+    locations = loc.body(columns="Entropia")
+  )
+  .cols_label(
+    cases = {
+      "Entropia": "{{H_7}}"
+    }
+  )
+  .cols_align(align="center")
+)
+```
+Najbardziej niezbalansowaną pod względem emocji jest kategoria filmów edukacyjnych, dominują tam komenarze wykazujące ciekawość i wdzięczność za filmy, natomiast niezwykle rzadko pojawiają się komentarze wykazujące złość. Najbardziej równomierną pod względem emocji jest kategoria Newsów i Polityki, zawiera ona również ponad przezciętną proporcje gniewu oraz mniejszą ilością szczęścia.
+
+```{python}
+#| label: fig-categories-distance
+#| fig-cap: Macierz ilustrująca odległości cosinusowe pomiędzy centroidami kategorii
+#| warning: false
+categories_distance_matrix = pl.read_csv("src_files/data/categories_distance_matrix.csv")
+
+(pltn.ggplot(
+    categories_distance_matrix
+      .unpivot(pl.selectors.numeric(), index="Kategorie")
+      .with_columns(pl.col("value").round(2).alias("Dystans"), 
+                    (pl.col("value") > .4).alias("is_high"))
+  ) 
+  +pltn.aes("factor(Kategorie)", "factor(variable)", fill="Dystans")
+  + pltn.geom_tile(pltn.aes(width=1, height=1))
+  + pltn.scale_fill_continuous(expand=(0.,1.))
+  #+ pltn.scale_color_manual(["white"])  
+  #+ pltn.scale_color_countinous()
+  + pltn.scale_fill_continuous(limits=[0., 1.])
+  + pltn.geom_text(pltn.aes(label="Dystans"), size=10, show_legend=False, color="white")
+  #+ pltn.scale_y_discrete(limits=Kategorie[::-1])
+  + pltn.theme(  #
+        axis_title=pltn.element_blank(),
+        axis_ticks=pltn.element_blank(),
+        panel_background=pltn.element_rect(fill="white"),
+        axis_text_x= pltn.element_text(angle = 90, hjust = 1, size=11),
+        axis_text_y = pltn.element_text(size=11),
+        figure_size=(7.5, 7.5)
+        #axis_text_x = element_text(angle = 90, hjust = 1)
+    )
+  +pltn.labs(title="Macierz odległości Kategorii")
+)
+```
+Do wyliczenia centroidów zastosowano tą samą technikę co w @sec-emocje.
+Jak pokazuje @fig-categories-distance, najbardziej zbliżone kategorie do siebie to kategorie rozrywkowe (Styl, Gry, Filmy i animacje, rozrywkowe, sporty), co może oznaczać to że można te kategorie połączyć w jedną. Za to filmy polityczne i edukacyjne wydają się najbardziej od siebie różne spośród kategorii.
+
+Poniżej przedstawiono najczęściej występujące słowa w postacii chmury słownej. 
+
+```{python}
+common_words_categories = (
+  pl.read_csv("src_files/data/common_words_categories.csv")
+  .with_columns(
+        pl.col("CategoryID")
+        .map_elements(category_dict.get, return_dtype=pl.String)
+        .cast(pl.Categorical)
+    )
+  )
+```
+
+::: {.panel-tabset}
+## Wiadomości i polityka
+```{python}
+#| fig-align: center
+plt.imshow(generate_wordcloud(common_words_categories, "CategoryID", "Wiadomości i polityka"))
+#plt.title.set_text("Wiadomości i polityka")
+#plt.title("Wiadomości i polityka")
+plt.axis("off")
+plt.show()
+```
+
+Jak ustalono w  @sec-dates, duża część komentarzy została zescrapowana w styczniu 2025, co zbiegło się z [wyborami prezydenckimi w USA 2025](https://en.wikipedia.org/wiki/2025_United_States_elections), co widać w słownictwie użytym w tej kategorii, chociażby po wystąpieniu nazwiska jednego z kandydatów w chmurze. 
+
+## Poradniki i styl życia
+```{python}
+#| fig-align: center
+plt.imshow(generate_wordcloud(common_words_categories, "CategoryID", "Poradniki i styl życia"))
+#plt.title("Poradniki i styl życia")
+plt.axis("off")
+plt.show()
+```
+
+## Sport
+```{python}
+#| fig-align: center
+plt.imshow(generate_wordcloud(common_words_categories, "CategoryID", "Sport"))
+plt.axis("off")
+plt.show()
+```
+
+## Rozrywka
+```{python}
+#| fig-align: center
+plt.imshow(generate_wordcloud(common_words_categories, "CategoryID", "Rozrywka"))
+plt.axis("off")
+plt.show()
+```
+
+## Zwierzęta
+```{python}
+#| fig-align: center
+plt.imshow(generate_wordcloud(common_words_categories, "CategoryID", "Zwierzęta"))
+plt.axis("off")
+plt.show()
+```
+
+Bardzo często wystepują tu słowa związane z kategorią, np. `cat` i `dog`. Również też często występuje słowo `love`, co może wiązać się z tym że najliczniejszą emocją jest radość (patrz @tbl-categories).
+
+## Nauka i technologie
+```{python}
+#| fig-align: center
+plt.imshow(generate_wordcloud(common_words_categories, "CategoryID", "Nauka i technologie"))
+plt.axis("off")
+plt.show()
+```
+
+## Motoryzacja i pojazdy
+```{python}
+#| fig-align: center
+plt.imshow(generate_wordcloud(common_words_categories, "CategoryID", "Motoryzacja i pojazdy"))
+plt.axis("off")
+plt.show()
+```
+
+Dominuje tutaj słowo `car`, co wiąże się z tematem kategorii.
+
+## Gry
+```{python}
+#| fig-align: center
+plt.imshow(generate_wordcloud(common_words_categories, "CategoryID", "Gry"))
+plt.axis("off")
+plt.show()
+```
+Dominuje tutaj słowo `game` oraz `play`, co wiąże się z tematem kategorii.
+
+## Ludzi i blogi
+```{python}
+#| fig-align: center
+plt.imshow(generate_wordcloud(common_words_categories, "CategoryID", "Ludzie i blogi"))
+plt.axis("off")
+plt.show()
+```
+
+## Film i animacja
+```{python}
+#| fig-align: center
+plt.imshow(generate_wordcloud(common_words_categories, "CategoryID", "Film i animacja"))
+plt.axis("off")
+plt.show()
+```
+Dominuje tutaj słowo `movie`, co wiąże się z tematem kategorii.
+:::
+
+By zbadać zależność między wykorzystano test $\chi^2$ wraz z siłą efekty $w$ Cohen'a. Konstruujemy następując hipotezy:
+
+- $H_0$ - Kategoria wideo i wyrażana emocja są od siebie **niezależne**.
+- $H_1$ - Kategoria wideo i wyrażana emocja są od siebie **zależne**.
+
+```{python}
+alpha = 0.05
+contingency_table = (
+  data
+  .group_by("Emotions", "CategoryID")
+  .len()
+  .pivot(
+    on="Emotions",
+    index="CategoryID",
+    values="len"
+  )
+  .select(pl.selectors.numeric())
+  .to_numpy()
+)
+
+result = chi2_contingency(contingency_table)
+
+w = np.sqrt(result.statistic / (len(data)))
+
+if result.pvalue < alpha:
+  hyp_result = "Można odrzucić $H_0$."
+else:
+  hyp_result = "Nie mozna odrzucić $H_0$"
+
+
+display(
+  Markdown(
+    f"wartość $p$ { "<" if result.pvalue < alpha else ">"} 0.05 <br>$w$ Cohena: {w:.5f} <br>{hyp_result}"
+  )
+)
+```
+Według interpretacji z [@cohen_statistical_2009, p. 227] kategoria wideo wykazuje **średnią** zależność wobec emocji wyrażanych w komentarzach. Przy tworzeniu modelu klasyfikującego zatem warto porównać dokładność modelu w różnych kategoriach tematycznych.
+
+## Podsumowanie
+
+Przeprowadzona analiza pozwoliła na scharakteryzowanie i porónanie między sobą emocji występujących w komentarzach, co dało wiele informacji w procesie inżynierii uczenia maszynowego. Zbiór danych prezentuje małą różnorodność pod względem krajów z których komentarze zostały opublikowane oraz czasie publikacje, więc dla lepszej generalizacji przydatna może okazać się dalsze zebranie danych. Wyodrębniono słowa silnie związane z emocjami, co sugeruje sprawdzenie metod probapilistycznych do klasyfikacji komentarzy, lub nawet zastosowanie heurystyk w celu przewidzenia emocji. Znaleziono również podobne semantycznie do siebie emocje.
+
+Sprawdono również czy da się poprawnie przewidzie na podstawie samych metadanych komentarza. Okazało się że nie ma *praktycznej* różnicy między długością komentarzy w różnych kategoriach emocji. Znaleziono niewielki związek pomiędzy tym czy dany komentarz został polubiony a tym jaką emocję przedstawiał. W wyniku analizy również okazało się, że rozłożenie emocji w filmach jest różnicowane przez to w jakiej kategorii temtu jest film. Zauważono również niezbalansowanie zbiou danych podwzględem kategorii występujących w zbiorze, dlatego przy tworzeniu modelu predykcyjnego warto porównać dokładność modelu w różnych kategoriach.
